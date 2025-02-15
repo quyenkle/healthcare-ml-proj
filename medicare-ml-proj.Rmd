@@ -1,0 +1,528 @@
+---
+title: "Predicting the Cost of Common Medical Procedures in California for Patients Covered by Medicare"
+author: "PSTAT 131 Final Project, Quyen Le"
+output:
+    html_document:
+      toc: true
+      toc_float: true
+      code_folding: show
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+## Introduction
+
+This project is aimed to develop and build a model that can predict the costs of some of the most common medical inpatient procedures for California patients who are covered by Medicare. I will be using data from the U.S. Department of Health & Human Services and the Centers for Medicare and Medicaid Services from the years 2019 to 2021.
+
+Inpatients are patients who are admitted to the hospital for multiple days while receiving treatment. Oftentimes, their medical conditions are much higher than others, since they require more intense around the clock care, which results in higher medical bills.
+
+## How Medicare is Structured
+
+Medicare is a federal health insurance program that is aimed for people who are 65 years old and older and younger people who have disabilities. When Medicare covered patients enter a hospital and receive Medicare approved services, the hospital will charge the payment to the Medicare insurance policy instead of the patient. However, patients are responsible for copayments (also known as copay), which is a percentage of the cost you pay for the services that you receive.
+
+As our population ages and people require more medical attention for diseases, injuries, etc., we learn that there is a lot of financial ambiguity when it comes when financing these medical procedures. With this model, those who are planning to enroll in Medicare or those who currently are covered by Medicare would be able to see how much a certain procedure would cost prior to getting the procedure done.
+
+## Exploratory Data Analysis
+
+### Loading Packages and Data
+
+```{r}
+# loading packages
+library(tidyverse)
+library(dplyr)
+library(tidymodels)
+library(readr)
+library(kknn)
+library(janitor)
+library(ISLR)
+library(discrim)
+library(poissonreg)
+library(glmnet)
+library(corrplot)
+library(vip)
+library(ranger)
+library(ggplot2)
+library(naniar)
+
+
+medicare_data_2019 <- read_csv("131 patient data/2019/2019_inpatient_charges.csv", show_col_types = FALSE)
+medicare_data_2020 <- read_csv("131 patient data/2020/2020_inpatient_charges.csv", show_col_types = FALSE)
+medicare_data_2021 <- read_csv("131 patient data/2021/2021_inpatient_charges.csv", show_col_types = FALSE)
+
+medicare_data <- rbind(medicare_data_2019, medicare_data_2020, medicare_data_2021)
+```
+
+The dataset I will be using is pulling data from 2019 to 2021 and will be saved in a dataset titled `medicare_data`. We will be using this dataset for the models throughout this project.
+
+### Checking for Missing Data
+
+Before fitting any models or analyzing our data, we will need to check if there is any missing data since we would have to use estimated values to fill in any gaps that exist. After running the `vis_miss` function, we learn that there is no missing data, so we don't have to worry about dealing with that.
+
+```{r}
+vis_miss(medicare_data)
+```
+
+## Tidying Medicare Data
+
+The original `medicare_data` dataset is comprised of many different states and DRG codes. A DRG code stands for 'Diagnosis-Related Group' and it is a system that is used to categorize different medical procedures. Since we are only interested in select DRG codes and data from the state of California, I filtered out the necessary data from the main dataset.
+
+### Removing Unnecessary Data Points
+
+Since I am mainly interested in the portion of the bill that the patient is responsible for, much of the descriptive variables (such as the provider's name, address, city name, etc) were not valuable and were omitted from the final dataset we used. Additionally, I was interested in 5 main DRG Codes: 871, 291, 193, 177, and 313.
+
+```{r}
+DRG_cds <- c('871', '291', '193', '177', '313')
+DRG_cds_tbl <- data.frame(DRG_codes = DRG_cds,
+                       DRG_description = c('SEPTICEMIA OR SEVERE SEPSIS',
+                                           'HEART FAILURE AND SHOCK', 
+                                           'SIMPLE PNEUMONIA AND PLEURISY', 
+                                           'RESPIRATORY INFECTIONS AND INFLAMMATIONS',
+                                           'CHEST PAIN'))
+
+DRG_cds_tbl
+```
+
+These values were recorded within the top 10 most common DRG codes that hospitals had reported. Since these were the most common, it is likely that many patients who were coming to hospital would expect to receive a treatment that falls into one of these DRG codes.
+
+```{r}
+medicare_data['copay'] = medicare_data['Avg_Tot_Pymt_Amt'] - medicare_data['Avg_Mdcr_Pymt_Amt']
+
+medicare_data_CA = subset(medicare_data, select = c('Rndrng_Prvdr_City',
+                                                 'Rndrng_Prvdr_State_Abrvtn',
+                                                 'DRG_Cd',
+                                                 'Tot_Dschrgs',
+                                                 'Avg_Submtd_Cvrd_Chrg',
+                                                 'Avg_Tot_Pymt_Amt',
+                                                 'Avg_Mdcr_Pymt_Amt',
+                                                 'copay'))
+medicare_data_CA = filter(medicare_data_CA, Rndrng_Prvdr_State_Abrvtn == 'CA' & (DRG_Cd == 871 | 
+                                                DRG_Cd == 291 | 
+                                                DRG_Cd == 193 | 
+                                                DRG_Cd == 177 | 
+                                                DRG_Cd == 313))
+
+medicare_data_CA <- medicare_data_CA[-c(1,2)]
+
+```
+
+Like I had mentioned before, we don't need all the information about the provider to learn more about the patient's Medicare payments. The variables I chose to focus on are outlined in the table below.
+
+```{r}
+all_vars_used <- c('Rndrng_Prvdr_City',
+             'Rndrng_Prvdr_State_Abrvtn',
+             'DRG_Cd',
+             'Tot_Dschrgs',
+             'Avg_Submtd_Cvrd_Chrg',
+             'Avg_Tot_Pymt_Amt',
+             'Avg_Mdcr_Pymt_Amt',
+             'copay')
+vars_tbl <- data.frame(Variables_Used = all_vars_used,
+                       Variable_description = c('City where the provider is located',
+                                                'State where the provider is located',
+                                                'DRG code that provider has provided services for',
+                                                'Total discharges for particular DRG code for provider',
+                                                'Average total charged provider bills the insurance provider',
+                                                'Average total amount that provider receives for services',
+                                                'Average total amount that Medicare covers for patient',
+                                                'Amount that patient is responsible for'))
+
+vars_tbl
+```
+
+### Visualizing the Data
+
+I wanted to get a better idea of how this data was organized and what patients were represented in the dataset, which required for me to create a box plot and correlation heat map.
+
+-   With a box plot, I would be able to see which DRG codes were most prevalent in the dataset to better understand how the results may be influenced.
+
+-   With a correlation heat map, I would be able to learn of any correlations between the variables to see how they interacted with each other and how that may also influence the end result.
+
+```{r}
+DRG_counts <- medicare_data_CA %>% count(DRG_Cd)
+barplot(DRG_counts$n,
+        main = 'Bar Plot of DRG Codes in California',
+        xlab = 'DRG Codes',
+        ylab = 'Count',
+        names.arg = c('871', '291', '193', '177', '313'),
+        col = c('#7FC8F8', '#6E6EC4', '#AD6F9F', '#EC6F79', '#FCC05F'))
+```
+
+The most common DRG Codes in California were 313, 193, and 871, with 291 and 177 being less common relative to the other DRG Codes. There will be relatively less data points to represent these medical procedures, and most of the data will be influenced by the DRG codes that appear more often.
+
+When taking a look at the data, we have 3111 observations to work with, which is a huge decrease from the original 33k+ `medicare_data` dataset that we had initially started working with.
+
+```{r}
+dim(medicare_data_CA)
+```
+
+### Correlation Plot
+
+```{r}
+medicare_data_CA %>% 
+  select(where(is.numeric)) %>% 
+  cor() %>% 
+  corrplot(type = "lower", diag = FALSE)
+```
+
+There is a high correlation between the average total payment and the average amount medicare covers. There is also a slightly negative correlation between the co payment amount and the total number of discharges.
+
+We can take a closer look at these correlations and see that they interact with each other.
+
+*Average Total Payment vs Average Medicare Payment*
+
+We see that there is a upwards trend when plotting the average total payment, which also includes the amount of the bill that the patient is responsible for, and the average medicare payment that Medicare will cover. This implies that even when the total cost of a service increases, Medicare is more likely to continue covering a consistent proportion of the cost. However, we can also see that there are many outliers where the Medicare coverage falls far below the the total payment.
+
+```{r}
+medicare_data_CA %>% 
+  ggplot(aes(x = Avg_Tot_Pymt_Amt, y = Avg_Mdcr_Pymt_Amt)) + 
+  geom_jitter(width = 0.5, size = 1) +
+  geom_smooth(method = "lm", se =F) +
+  labs(title = "Average Total Payment vs Average Medicare Payment", 
+       x = 'Average Total Payment Amount', 
+       y = 'Average Medicare Payment Amount')
+```
+
+*Total Discharges vs Copayments*
+
+Another interesting relationship to take a closer look at is that of total discharges and copayments. We can see that there is a slight negative trend as the total discharges increases, implying that when a hospital has more patients discharged after receiving a certain procedure, the amount of the bill that the patient is responsible for slightly decreases. This could be due to the lower unit cost of materials that hospitals incur to cater to the patients who require procedures that the hospital is well equipped for. They are able to save on costs, which means that the patients don't need to pay as much.
+
+```{r}
+medicare_data_CA %>% 
+  ggplot(aes(x = Tot_Dschrgs, y = copay)) + 
+  geom_jitter(width = 0.5, size = 1) +
+  geom_smooth(method = "lm", se =F) +
+  labs(title = "Total Discharges vs Copayments", x = 'Total Discharges', y = 'Copayment')
+```
+
+## Creating the Models
+
+### Splitting the Data
+
+When creating models, we'll need to split the data into a training set and testing set, with the former used to train the models and the latter used to test the accuracy of our trained model on untouched data. I went with a 80/20 split for our data since we have a little over 3,000 data points, which allows for more of the data to be used for training.
+
+I also stratified our split on the response variable, `Avg_Tot_Pymt_Amt`, which is the total that the hospital receives for its services. It consists of both the insurance payment, as well as the portion that the patient is responsible for. By making this variable the response variable, we will train a model that can predict how much the hospital will receive, thus allowing patients to have an idea of how much they will be responsible for, given they have an idea of how much Medicare will cover.
+
+```{r}
+#to reproduce results again
+set.seed(123)
+
+#splitting data
+medicare_CA_split <- initial_split(medicare_data_CA, prop = 0.8, strata = Avg_Tot_Pymt_Amt)
+medicare_CA_train <- training(medicare_CA_split)
+dim(medicare_CA_train)
+
+medicare_CA_test <- testing(medicare_CA_split)
+dim(medicare_CA_test)
+```
+
+In the training dataset, we see that there are 2487 data points and in the testing dataset, we see that there are 624 data points.
+
+### K-Fold Cross Validation
+
+K-fold cross validation is a method that helps split our training data set into additional smaller data sets that we can individually train our model with, providing it with more information and exposure without jeopardizing the integrity of the data. I split the training data into 8 folds and stratified it according to the response variable.
+
+```{r}
+medicare_CA_fold <- vfold_cv(data = medicare_CA_train, 
+                              v = 8, 
+                              strata = Avg_Tot_Pymt_Amt)
+```
+
+### Recipe Creation
+
+Now that we have the data tidy and folds creates, we can develop the recipe that this model will be built on. This recipe defines the response variable `Avg_Tot_Pymt_Amt` and all the predictor variables: `DRG_Cd`, `Tot_Dschrgs`, and `Avg_Submtd_Cvrd_Chrg`. We also need to normalize all the variables by centering the predictors and scaling the predictors, which are done at the bottom of the recipe.
+
+```{r}
+medicare_recipe <- recipe(Avg_Tot_Pymt_Amt ~ DRG_Cd +
+                           Tot_Dschrgs + 
+                           Avg_Submtd_Cvrd_Chrg, 
+                         data = medicare_CA_train) %>% 
+  step_dummy(all_nominal_predictors()) %>% 
+  step_normalize(all_predictors()) %>%
+  step_center(all_predictors()) %>%
+  step_scale(all_predictors())
+```
+
+## Setting Up the Models
+
+We will be setting up the following four models and fitting our training Medicare dataset to them:
+
+-   Linear Regression
+
+-   Nearest Neighbor KNN
+
+-   Elastic Net
+
+-   Random Forest
+
+When setting up the models, we need to following the steps outlined below for each model:
+
+1.  Set up the model environment
+2.  Set up the workflow and add the recipe we had created above
+
+Then for models that require tuning, we also need to complete the third step below:
+
+3.  Set up a grid that will be used when tuning the model hyper parameters
+
+The only model that does not require tuning in this project will be the linear regression model since it does not have any hyper parameters that need to be tuned. For the other three models however, we will need to complete the third step when setting up the models.
+
+```{r}
+# linear regression model
+# tuning is not necessary
+lm_model <- linear_reg() %>% 
+  set_engine("lm")
+
+# setting up workflow
+lm_wflow <- workflow() %>% 
+  add_model(lm_model) %>% 
+  add_recipe(medicare_recipe)
+```
+
+```{r}
+# nearest neighbor
+knn_mod_cv <- nearest_neighbor(neighbors = tune()) %>%
+  set_mode("regression") %>%
+  set_engine("kknn")
+
+# setting up workflow
+knn_wkflow_cv <- workflow() %>% 
+  add_model(knn_mod_cv) %>% 
+  add_recipe(medicare_recipe)
+
+# setting up grid for tuning
+knn_grid <- grid_regular(neighbors(range = c(1, 10)), levels = 10)
+```
+
+```{r}
+# elastic net model
+#engine
+elastic_net <- linear_reg(penalty = tune(), 
+                           mixture = tune()) %>% 
+  set_mode("regression") %>% 
+  set_engine("glmnet")
+
+#workflow
+elastic_net_workflow <- workflow() %>% 
+  add_recipe(medicare_recipe) %>% 
+  add_model(elastic_net)
+
+#grid
+grid <- grid_regular(penalty(range = c(-5, 5)), 
+                        mixture(range = c(0, 1)), levels = 10)
+```
+
+```{r}
+# random forest model
+rf_model <- rand_forest(mtry = tune(), 
+                           trees = tune(), 
+                           min_n = tune()) %>%
+  set_engine("ranger", importance = "impurity") %>% 
+  set_mode("regression")
+
+rf_wf <- workflow() %>% 
+  add_model(rf_model) %>% 
+  add_recipe(medicare_recipe)
+
+rf_grid <- grid_regular(mtry(range = c(1, 6)), 
+                        trees(range = c(200, 600)),
+                        min_n(range = c(10, 20)),
+                        levels = 8)
+```
+
+## Tuning Models
+
+Tuning allow for us to identify which value of the hyper parameter would yield the best results. I had already saved the tuning results to an additional file to prevent having to rerun it every time we want to see the results of the tuning. Below is the code that was used to create the files.
+
+```{r}
+# linear regression
+# does not require tuning
+
+
+# # nearest neighbors
+# tune_res <- tune_grid(
+#   object = knn_wkflow_cv,
+#   resamples = medicare_CA_fold,
+#   grid = knn_grid
+# )
+# 
+# write_rds(tune_res, file = "tuning_results/neighbors.rds")
+# 
+# # elastic net model
+# tune_elastic <- tune_grid(
+#   elastic_net_workflow,
+#   resamples = medicare_CA_fold,
+#   grid = grid
+# )
+# 
+# write_rds(tune_elastic, file = "tuning_results/elastic.rds")
+# 
+# 
+# # random forest model
+# tune_class <- tune_grid(
+#   rf_wf,
+#   resamples = medicare_CA_fold,
+#   grid = rf_grid
+# )
+# 
+# write_rds(tune_class, file = "tuning_results/randomforest.rds")
+
+```
+
+```{r}
+# nearest neighbors
+tune_knn <- read_rds(file = "tuning_results/neighbors.rds")
+
+# elastic net model
+tune_elastic <- read_rds(file = "tuning_results/elastic.rds")
+
+# random forest model
+tune_rf <- read_rds(file = "tuning_results/randomforest.rds")
+```
+
+### Fitting Models
+
+Now that we have all the models set up and the optimal hyper parameter values that each model needs to be set to, we can fit all of the models. We will be looking at the RMSE value, which stands for Root Mean Square Error, since it will provide insight on how well the model performs relative to each other.
+
+```{r}
+# linear regression
+lm_fit <- fit_resamples(lm_wflow, resamples = medicare_CA_fold)
+lm_rmse <- collect_metrics(lm_fit)
+lm_mean <- filter(lm_rmse, .metric == 'rmse')
+lm_mean <- lm_mean$mean
+
+# nearest neighbors
+knn_fit <- collect_metrics(tune_knn)
+knn_rmse_val <- filter(knn_fit, .metric == 'rmse')
+knn_mean <- mean(knn_rmse_val$mean)
+
+# elastic net model
+en_fit <- collect_metrics(tune_elastic)
+en_rmse_val <- filter(en_fit, .metric == 'rmse')
+en_mean <- mean(en_rmse_val$mean)
+
+# random forest model
+rf_fit <- collect_metrics(tune_rf)
+rf_rmse_val <- filter(rf_fit, .metric == 'rmse')
+rf_mean <- mean(rf_rmse_val$mean)
+```
+
+## Visualizing the Models
+
+We can see how the models did by plotting the tuning results.
+
+### Nearest Neighbors KNN Model
+
+We can see that the model produces the lowest RMSE value when we look at 10 neighbors for each value. Although this could yield a great model, it is important to realize that looking for 10 neighbors for every data point could sacrifice the speed and efficiency of the model. Oftentimes, we would opt for a smaller neighbors value that yields a close enough RMSE value so that the efficiency of the model isn't compromised. However in this case, because the RMSE value continues to decline, choosing 10 neighbors would still be the optimal choice.
+
+```{r}
+# nearest neighbors
+autoplot(tune_knn, metric='rmse')
+```
+
+### Elastic Net Model
+
+From the tuning results of the elastic net model, we can see that the lower penalty values produce the best models. As the penalty proportion increases, we see that there is a greater increase in error, which would create a more inaccurate model. For mixture values, we really only see mixture values doing well for high penalty values, which shoot up after 1e+03.
+
+```{r}
+#the elastic net model
+autoplot(tune_elastic, metric='rmse')
+```
+
+### Random Forest Model
+
+For this models, we tuned three parameters: `mtry`, `trees`,`min_n`. We can see from the plots below that when we are looking at the higher node sizes, we often see that the models that use fewer trees have a slightly lower RMSE value compared to models that use more trees. Since we are increasing the node size, which increases the number of predictors, we're allowing for the model to have more information about the data before making a prediction. For many of the models, there is a lower RMSE value until 400 or so trees, then there is a sudden increase that doesn't drop until we get closer to 600 trees.
+
+```{r}
+#the random forest model
+autoplot(tune_rf, metric='rmse')
+```
+
+### Comparing Model Performance
+
+We can see from the table below that the model with the lowest average RMSE value was the Random Forest. This was followed by the Nearest Neighbors, Linear Regression, and lastly the Elastic Net Model.
+
+```{r}
+model_names <- c('Linear Regression', 'Nearest Neighbors', 'Elastic Net Model', 'Random Forest Model')
+RMSE_mean_vals <-c(lm_mean, knn_mean, en_mean, rf_mean)
+mean_tbl <- as.data.frame(RMSE_mean_vals, row.names = model_names)
+mean_tbl
+```
+
+## Best Model Selection
+
+Since we found that the Random Forest Model performed the best overall out of all the other models, we need to find which model within all the Random Forest Models performed the best. We learn that the model with an mtry value of 1, 314 trees, and a min_n of 14 does the best, with a total RMSE of 5794, which is lower than the average for Random Forest Models overall.
+
+```{r}
+# random forest model
+best_model <- show_best(tune_rf, n = 1, metric = 'rmse')
+best_model
+```
+
+## Fitting to the Training Data
+
+We can create the best model under the training data with the hyper parameters that were picked out above. This model will be used to fit the testing data below.
+
+```{r}
+#select best model
+best_rf_model <- select_best(tune_rf, metric = "rmse")
+
+#training model
+rd_final <- finalize_workflow(rf_wf, best_rf_model)
+rd_final_fit <- fit(rd_final, data = medicare_CA_train)
+```
+
+### Fitting to the Testing Data
+
+Now that we've created our optimal model, we can use the testing data to see how well this model can predict the total payment amounts to the provider for specific healthcare services.
+
+```{r}
+predicted_test_data <- augment(rd_final_fit, new_data = medicare_CA_test) %>% 
+  select(Avg_Tot_Pymt_Amt, starts_with(".pred"))
+
+rmse_metric <- metric_set(rmse)
+
+medicare_metrics <- rmse_metric(predicted_test_data, truth = Avg_Tot_Pymt_Amt, estimate = .pred)
+medicare_metrics
+```
+
+We can see that the model performed better with test data, having an RMSE value of 5214.875, which was lower than our training model RMSE value. Although this is still relatively high to other RMSE values, because the cost of these procedures is so high, it is not surprising that we would have a higher RMSE value since the numbers we are dealing with are so much higher.
+
+We can visualize how well our model did in the plot below.
+
+```{r}
+ggplot(predicted_test_data, aes(x = .pred, y = Avg_Tot_Pymt_Amt)) +
+  geom_point(alpha = 0.2) +
+  geom_abline(lty = 1) +
+  labs(title = 'Predicted Average Total Payments vs Actual Average Total Payments')
+```
+
+Ideally, we would have more points that are on the line since that would mean that they were accurately predicted. More of the points laid in clusters around the line, which indicates that the model was relatively close to predicting the correct total payment amount to the provider. The model consistently predicted values that were close to the true value, so in the end, this model could provide the user some knowledge about how much a certain procedure would cost them if they were to go to a California hospital.
+
+### Variable Importance
+
+For random forest models, we can also see which variable was the most influential in the prediction and modeling of the data. From the graph below, you can see that the DRG code that each service is categorize in is the most important variable, which isn't surprising since different medical services use different materials and could greatly vary in cost.
+
+I am surprised that the total amount of discharges is ranked at the bottom, I would assume that if a hospital is more readily equipped and able to cater to a specific DRG service, then it would influence whether or not the cost would be high. However, relative to the total cost that the hospital charges (unsurprisingly), it isn't as important in determining how much the hospital receives for the service.
+
+```{r}
+rd_final_fit %>% extract_fit_parsnip() %>% 
+  vip() +
+  theme_minimal()
+```
+
+## Conclusion
+
+Out of the four models that I had fitted the Medicare data with, we learned that the Random Forest Model using 314 trees is the most accurate when predicting how much the provider will receive for specific DRG services. With random forest models being one of the more detailed and holistic models when modeling data, it is not surprising that this was the model that performed the best. However, despite its performance, there were still many inaccurate predictions and the model was not able to take many other factors into account, simply due to the lack of information in the original dataset.
+
+This model allowed for us to learn that the cost of medical services for patients who are covered by Medicare are strongly influenced by the type of service that they are receiving. Different DRG codes result in different needs, which result in varying prices. However, we also see that the proportion that patients are responsible for aren't exactly unique to each patient and that we can easily find an estimate to provide patients prior to receiving the medical service. By using only having the type of medical service and total charge from the hospital, we would be able to estimate how much the insurance provider and patient would need to pay for that particular service.
+
+An improvement that I would like to implement for this model to increase its accuracy would be to add more variables that could provide greater insight into the fluctuations we see. Adding more information about the patient's ethnicity, income bracket, age range, and more could provide the model with details about how the total average cost could be influenced. Because this dataset provided lots of information that wasn't helpful in determining the total cost, it greatly narrowed the scope when predicting the cost. It would be incredibly interesting to see if ethnicity or age could greatly influence the total cost for patients since that could point to other factors that medical insurance providers should take into account before drafting their policies.
+
+Another change I would make in the set up of this model would be splitting the data into smaller sections, possibly by DRG code, and setting up individual models for each DRG code. Because the way one would finance treatment for a heart attack differs from that of sepsis, it is harder for the model to try and take everything into account and predict the cost accurately. With more information about the patients and the community that these hospitals are serving, coupled with splitting the data into smaller, more specific sections, we could be able to create a more accurate model.
+
+With my interest in financial data coupled with the importance of health insurance, I see the value of machine learning in other industries. With this project, I aimed to learn more about health insurance and what factors influence cost, but I also saw the value in the model's ability to allow patients to take control of their financial security by being able to predict how much hospital bills were going to be. The ambiguity that hospitals have around how much their services cost places an incredible amount of stress on patients whose sole priority should be recovery and their health. Even if the prediction is slightly inaccurate, having a realistic ballpark estimate is much more valuable than having none at all.
+
+## Sources
+
+Medicare and inpatient data was taken from the [CMS database](https://data.cms.gov/provider-summary-by-type-of-service/medicare-inpatient-hospitals/medicare-inpatient-hospitals-by-provider-and-service/data)
